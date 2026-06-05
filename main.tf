@@ -1,5 +1,3 @@
-### 2. `main.tf`
-```hcl
 # AWS Bedrock Enterprise Guardrails Infrastructure Architecture
 
 # 1. Automated Encryption Key for GenAI Telemetry Data
