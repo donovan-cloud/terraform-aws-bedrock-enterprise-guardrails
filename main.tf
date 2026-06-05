@@ -1,5 +1,9 @@
 # AWS Bedrock Enterprise Guardrails Infrastructure Architecture
 
+# Data sources required for dynamic account tracking
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
 # 1. Automated Encryption Key for GenAI Telemetry Data
 resource "aws_kms_key" "bedrock_security_key" {
   description             = "KMS Key for Bedrock Audit Logs and Model Invocations"
@@ -9,8 +13,9 @@ resource "aws_kms_key" "bedrock_security_key" {
 
 # 2. Immutable S3 Data Vault for LLM Input/Output Tracking
 resource "aws_s3_bucket" "bedrock_audit_vault" {
-  bucket        = "enterprise-bedrock-invocation-audit-vault-prod"
-  force_destroy = false
+  bucket              = "enterprise-bedrock-invocation-audit-vault-prod"
+  force_destroy       = false
+  object_lock_enabled = true # Aligns code with WORM capabilities in README
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "vault_encryption" {
@@ -31,7 +36,46 @@ resource "aws_s3_bucket_public_access_block" "block_vault_public_access" {
   restrict_public_buckets = true
 }
 
-# 3. Enterprise Bedrock Guardrail Deployment
+# 3. Mandatory S3 Bucket Policy allowing Amazon Bedrock to write telemetry logs
+resource "aws_s3_bucket_policy" "allow_bedrock_logging" {
+  bucket = aws_s3_bucket.bedrock_audit_vault.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowBedrockToPutLogs"
+        Effect = "Allow"
+        Principal = {
+          Service = "://amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.bedrock_audit_vault.arn}/bedrock-invocation-telemetry/*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      {
+        Sid    = "AllowBedrockToGetBucketLocation"
+        Effect = "Allow"
+        Principal = {
+          Service = "://amazonaws.com"
+        }
+        Action   = "s3:GetBucketLocation"
+        Resource = aws_s3_bucket.bedrock_audit_vault.arn
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
+# 4. Enterprise Bedrock Guardrail Deployment
 resource "aws_bedrock_guardrail" "enterprise_guardrail" {
   name        = "corporate-compliance-guardrail-prod"
   description = "Enforces PII masking and blocks prompt injection variants for production models"
@@ -39,17 +83,17 @@ resource "aws_bedrock_guardrail" "enterprise_guardrail" {
   # Block Toxicity and Malicious Content
   content_filter_config {
     filters {
-      type       = "PROMPT_ATTACK" # Prevents prompt injection, jailbreaking, and system override attempts
+      type            = "PROMPT_ATTACK"
       input_strength  = "HIGH"
       output_strength = "NONE"
     }
     filters {
-      type       = "HATE"
+      type            = "HATE"
       input_strength  = "HIGH"
       output_strength = "HIGH"
     }
     filters {
-      type       = "VIOLENCE"
+      type            = "VIOLENCE"
       input_strength  = "HIGH"
       output_strength = "HIGH"
     }
@@ -85,9 +129,14 @@ resource "aws_bedrock_guardrail" "enterprise_guardrail" {
   blocked_output_messaging = "Model output was intercepted due to sensitive corporate data leak identification."
 }
 
-# 4. Centralized Inference Model Invocation Logging
+# 5. Centralized Inference Model Invocation Logging Configuration
 resource "aws_bedrock_model_invocation_logging_configuration" "audit_logging" {
-  dependent_on = [aws_s3_bucket_public_access_block.block_vault_public_access]
+  # Fixed critical syntax typo from dependent_on to depends_on
+  # Added the bucket policy requirement as an explicit dependency
+  depends_on = [
+    aws_s3_bucket_public_access_block.block_vault_public_access,
+    aws_s3_bucket_policy.allow_bedrock_logging
+  ]
 
   logging_config {
     embedding_data_delivery_enabled = true
